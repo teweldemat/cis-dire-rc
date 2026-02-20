@@ -1112,14 +1112,25 @@ class RemoteControlApi:
 
     def _du_size_bytes(self, path: str, timeout_seconds: int) -> tuple[int | None, str]:
         out = run_cmd(["du", "-sB1", path], timeout=timeout_seconds)
-        if not out["ok"]:
-            return None, out["stderr"] or out["stdout"] or "du failed"
+        # du can return non-zero for partial permission errors while still producing a usable size.
         first = (out["stdout"].splitlines() or [""])[0].strip()
         if not first:
+            if not out["ok"]:
+                err = (out["stderr"] or out["stdout"] or "du failed").strip()
+                if "Permission denied" in err:
+                    return None, "Some subdirectories were skipped due to permissions."
+                return None, err
             return None, "du returned empty output"
         size_txt = first.split("\t", 1)[0].strip().split(" ", 1)[0].strip()
         try:
-            return int(size_txt), ""
+            if out["ok"]:
+                return int(size_txt), ""
+            err = (out["stderr"] or "").strip()
+            if not err:
+                return int(size_txt), ""
+            if "Permission denied" in err:
+                return int(size_txt), "Some subdirectories were skipped due to permissions."
+            return int(size_txt), err.splitlines()[0][:240]
         except ValueError:
             return None, f"Unable to parse du output: {first}"
 
@@ -1206,9 +1217,6 @@ class RemoteControlApi:
                 watch_paths_out.append(entry)
                 continue
             entry["exists"] = True
-            du_bytes, du_error = self._du_size_bytes(path, timeout_seconds=path_timeout_seconds)
-            entry["du_bytes"] = du_bytes
-            entry["error"] = du_error
 
             fs = self._filesystem_for_path(path, filesystems)
             if fs:
@@ -1218,6 +1226,14 @@ class RemoteControlApi:
                 entry["fs_used_pct"] = fs.get("used_pct")
                 entry["fs_inodes_used_pct"] = fs.get("inodes_used_pct")
                 entry["is_alert"] = fs.get("is_alert", False)
+                if str(fs.get("mount", "")) == path and fs.get("used_bytes") is not None:
+                    # For mount roots, use df's used bytes to avoid noisy permission issues from du.
+                    entry["du_bytes"] = fs.get("used_bytes")
+                    entry["error"] = ""
+                else:
+                    du_bytes, du_error = self._du_size_bytes(path, timeout_seconds=path_timeout_seconds)
+                    entry["du_bytes"] = du_bytes
+                    entry["error"] = du_error
             else:
                 entry["mount"] = None
                 entry["filesystem"] = None
@@ -1225,6 +1241,9 @@ class RemoteControlApi:
                 entry["fs_used_pct"] = None
                 entry["fs_inodes_used_pct"] = None
                 entry["is_alert"] = False
+                du_bytes, du_error = self._du_size_bytes(path, timeout_seconds=path_timeout_seconds)
+                entry["du_bytes"] = du_bytes
+                entry["error"] = du_error
             watch_paths_out.append(entry)
 
         alerts = [
