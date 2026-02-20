@@ -46,6 +46,10 @@ This directory contains a standalone system control board for DIRE deployment op
 
 Probe definitions are in `python-backend/config.json` under `scheduled_probes`, and results are surfaced via `/api/v1/status` so the UI reads cached state instead of running expensive checks on every refresh.
 
+## Disk visibility
+
+The status payload includes a comprehensive disk report with per-filesystem space/inode usage plus watched path sizes (configured under `targets.disk_report`).
+
 ## First-time setup on server
 
 ```bash

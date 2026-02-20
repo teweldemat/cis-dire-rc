@@ -39,7 +39,32 @@
         "port": 8080,
         "timeout_seconds": 1.5
       }
-    ]
+    ],
+    "disk_report": {
+      "refresh_seconds": 120,
+      "path_timeout_seconds": 20,
+      "alert_used_pct": 85,
+      "alert_inode_pct": 85,
+      "exclude_fs_types": [
+        "tmpfs",
+        "devtmpfs",
+        "overlay",
+        "squashfs",
+        "proc",
+        "sysfs",
+        "cgroup2",
+        "mqueue"
+      ],
+      "watch_paths": [
+        "/",
+        "/var",
+        "/var/lib/docker",
+        "/opt",
+        "/home",
+        "/var/log"
+      ],
+      "max_path_entries": 12
+    }
   },
   "scheduled_probes": [
     {

@@ -208,6 +208,18 @@ def parse_url_host_port(url: str) -> tuple[str, int]:
     return host, (443 if p.scheme == "https" else 80)
 
 
+def parse_percent(value: str) -> float | None:
+    txt = str(value).strip()
+    if txt.endswith("%"):
+        txt = txt[:-1]
+    if not txt:
+        return None
+    try:
+        return float(txt)
+    except ValueError:
+        return None
+
+
 class SQLiteStore:
     def __init__(self, db_path: Path):
         self.db_path = db_path
@@ -905,6 +917,9 @@ class RemoteControlApi:
         self.store = SQLiteStore(self.db_path)
         self.probe_runner = ProbeRunner()
         self.store.sync_probe_definitions(self._configured_scheduled_probes())
+        self._disk_cache_lock = threading.Lock()
+        self._disk_cache_at: dt.datetime | None = None
+        self._disk_cache_payload: dict[str, Any] | None = None
 
     def require_token(self, provided: str) -> bool:
         if not self.admin_token:
@@ -928,6 +943,12 @@ class RemoteControlApi:
         if isinstance(items, list):
             return [x for x in items if isinstance(x, dict)]
         return []
+
+    def _configured_disk_report(self) -> dict[str, Any]:
+        disk_report = self.config.get("targets", {}).get("disk_report", {})
+        if isinstance(disk_report, dict):
+            return disk_report
+        return {}
 
     def _service_status(self, service_name: str) -> dict[str, Any]:
         out = run_cmd(
@@ -985,9 +1006,285 @@ class RemoteControlApi:
             }
         return result, ""
 
+    @staticmethod
+    def _mount_matches_path(path: str, mount: str) -> bool:
+        if mount == "/":
+            return True
+        normalized_mount = mount.rstrip("/")
+        return path == normalized_mount or path.startswith(f"{normalized_mount}/")
+
+    def _filesystem_for_path(self, path: str, filesystems: list[dict[str, Any]]) -> dict[str, Any] | None:
+        candidates = [fs for fs in filesystems if self._mount_matches_path(path, str(fs.get("mount", "")))]
+        if not candidates:
+            return None
+        return sorted(candidates, key=lambda fs: len(str(fs.get("mount", ""))), reverse=True)[0]
+
+    def _parse_df_filesystems(
+        self,
+        stdout: str,
+        excluded_fs_types: set[str],
+    ) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        lines = stdout.splitlines()
+        for line in lines[1:]:
+            parts = line.split(None, 6)
+            if len(parts) < 7:
+                continue
+            filesystem, fs_type, total_raw, used_raw, free_raw, used_pct_raw, mount = parts
+            if fs_type in excluded_fs_types:
+                continue
+            try:
+                total = int(total_raw)
+                used = int(used_raw)
+                free = int(free_raw)
+            except ValueError:
+                continue
+            used_pct = parse_percent(used_pct_raw)
+            if used_pct is None:
+                used_pct = (used / total * 100.0) if total > 0 else 0.0
+            out.append(
+                {
+                    "filesystem": filesystem,
+                    "fs_type": fs_type,
+                    "mount": mount,
+                    "total_bytes": total,
+                    "used_bytes": used,
+                    "free_bytes": free,
+                    "used_pct": round(float(used_pct), 2),
+                }
+            )
+        return out
+
+    def _parse_df_posix_k(self, stdout: str) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        lines = stdout.splitlines()
+        for line in lines[1:]:
+            parts = line.split(None, 5)
+            if len(parts) < 6:
+                continue
+            filesystem, total_raw, used_raw, free_raw, used_pct_raw, mount = parts
+            try:
+                total = int(total_raw) * 1024
+                used = int(used_raw) * 1024
+                free = int(free_raw) * 1024
+            except ValueError:
+                continue
+            used_pct = parse_percent(used_pct_raw)
+            if used_pct is None:
+                used_pct = (used / total * 100.0) if total > 0 else 0.0
+            out.append(
+                {
+                    "filesystem": filesystem,
+                    "fs_type": "unknown",
+                    "mount": mount,
+                    "total_bytes": total,
+                    "used_bytes": used,
+                    "free_bytes": free,
+                    "used_pct": round(float(used_pct), 2),
+                }
+            )
+        return out
+
+    def _parse_df_inodes(self, stdout: str) -> dict[str, dict[str, Any]]:
+        out: dict[str, dict[str, Any]] = {}
+        lines = stdout.splitlines()
+        for line in lines[1:]:
+            parts = line.split(None, 5)
+            if len(parts) < 6:
+                continue
+            _filesystem, total_raw, used_raw, free_raw, used_pct_raw, mount = parts
+            try:
+                total = int(total_raw)
+                used = int(used_raw)
+                free = int(free_raw)
+            except ValueError:
+                continue
+            used_pct = parse_percent(used_pct_raw)
+            if used_pct is None:
+                used_pct = (used / total * 100.0) if total > 0 else 0.0
+            out[mount] = {
+                "inodes_total": total,
+                "inodes_used": used,
+                "inodes_free": free,
+                "inodes_used_pct": round(float(used_pct), 2),
+            }
+        return out
+
+    def _du_size_bytes(self, path: str, timeout_seconds: int) -> tuple[int | None, str]:
+        out = run_cmd(["du", "-sB1", path], timeout=timeout_seconds)
+        if not out["ok"]:
+            return None, out["stderr"] or out["stdout"] or "du failed"
+        first = (out["stdout"].splitlines() or [""])[0].strip()
+        if not first:
+            return None, "du returned empty output"
+        size_txt = first.split("\t", 1)[0].strip().split(" ", 1)[0].strip()
+        try:
+            return int(size_txt), ""
+        except ValueError:
+            return None, f"Unable to parse du output: {first}"
+
+    def _build_disk_report(self, now_dt: dt.datetime) -> dict[str, Any]:
+        config = self._configured_disk_report()
+        refresh_seconds = max(5, int(config.get("refresh_seconds", 120)))
+        path_timeout_seconds = max(1, int(config.get("path_timeout_seconds", 20)))
+        alert_used_pct = float(config.get("alert_used_pct", 85.0))
+        alert_inode_pct = float(config.get("alert_inode_pct", 85.0))
+
+        excluded_fs_types = set(
+            str(x).strip()
+            for x in config.get(
+                "exclude_fs_types",
+                ["tmpfs", "devtmpfs", "overlay", "squashfs", "proc", "sysfs", "cgroup2", "mqueue"],
+            )
+            if str(x).strip()
+        )
+
+        default_watch_paths = ["/", "/var", "/var/lib/docker", "/opt", "/home", "/var/log"]
+        watch_paths_raw = config.get("watch_paths", default_watch_paths)
+        watch_paths: list[str] = []
+        if isinstance(watch_paths_raw, list):
+            for item in watch_paths_raw:
+                txt = str(item).strip()
+                if txt:
+                    watch_paths.append(txt)
+        if not watch_paths:
+            watch_paths = default_watch_paths
+        max_path_entries = max(1, int(config.get("max_path_entries", 12)))
+        watch_paths = watch_paths[:max_path_entries]
+
+        errors: list[str] = []
+        df_blocks = run_cmd(["df", "-PT", "-B1"], timeout=12)
+        filesystems: list[dict[str, Any]] = []
+        if df_blocks["ok"]:
+            filesystems = self._parse_df_filesystems(df_blocks["stdout"], excluded_fs_types)
+        if (not df_blocks["ok"]) or (len(filesystems) == 0):
+            df_posix = run_cmd(["df", "-Pk"], timeout=12)
+            if df_posix["ok"]:
+                filesystems = self._parse_df_posix_k(df_posix["stdout"])
+            else:
+                errors.append(
+                    "df blocks failed: "
+                    + (df_blocks["stderr"] or df_blocks["stdout"] or "")
+                    + " | fallback failed: "
+                    + (df_posix["stderr"] or df_posix["stdout"] or "")
+                )
+                filesystems = []
+
+        df_inodes = run_cmd(["df", "-Pi"], timeout=12)
+        inode_by_mount: dict[str, dict[str, Any]] = {}
+        if not df_inodes["ok"]:
+            errors.append(f"df inodes failed: {df_inodes['stderr'] or df_inodes['stdout']}")
+        else:
+            inode_by_mount = self._parse_df_inodes(df_inodes["stdout"])
+
+        for fs in filesystems:
+            inode_data = inode_by_mount.get(str(fs.get("mount", "")))
+            if inode_data:
+                fs.update(inode_data)
+            else:
+                fs.update(
+                    {
+                        "inodes_total": None,
+                        "inodes_used": None,
+                        "inodes_free": None,
+                        "inodes_used_pct": None,
+                    }
+                )
+            used_alert = float(fs.get("used_pct", 0.0)) >= alert_used_pct
+            inode_used_pct = fs.get("inodes_used_pct")
+            inode_alert = inode_used_pct is not None and float(inode_used_pct) >= alert_inode_pct
+            fs["is_alert"] = bool(used_alert or inode_alert)
+
+        filesystems = sorted(filesystems, key=lambda fs: float(fs.get("used_pct", 0.0)), reverse=True)
+
+        watch_paths_out: list[dict[str, Any]] = []
+        for path in watch_paths:
+            entry: dict[str, Any] = {"path": path, "exists": False}
+            p = Path(path)
+            if not p.exists():
+                entry["error"] = "Path does not exist"
+                watch_paths_out.append(entry)
+                continue
+            entry["exists"] = True
+            du_bytes, du_error = self._du_size_bytes(path, timeout_seconds=path_timeout_seconds)
+            entry["du_bytes"] = du_bytes
+            entry["error"] = du_error
+
+            fs = self._filesystem_for_path(path, filesystems)
+            if fs:
+                entry["mount"] = fs.get("mount")
+                entry["filesystem"] = fs.get("filesystem")
+                entry["fs_type"] = fs.get("fs_type")
+                entry["fs_used_pct"] = fs.get("used_pct")
+                entry["fs_inodes_used_pct"] = fs.get("inodes_used_pct")
+                entry["is_alert"] = fs.get("is_alert", False)
+            else:
+                entry["mount"] = None
+                entry["filesystem"] = None
+                entry["fs_type"] = None
+                entry["fs_used_pct"] = None
+                entry["fs_inodes_used_pct"] = None
+                entry["is_alert"] = False
+            watch_paths_out.append(entry)
+
+        alerts = [
+            {
+                "mount": fs.get("mount"),
+                "filesystem": fs.get("filesystem"),
+                "fs_type": fs.get("fs_type"),
+                "used_pct": fs.get("used_pct"),
+                "inodes_used_pct": fs.get("inodes_used_pct"),
+            }
+            for fs in filesystems
+            if fs.get("is_alert")
+        ]
+
+        return {
+            "collected_at": now_dt.isoformat(),
+            "refresh_seconds": refresh_seconds,
+            "alert_used_pct": alert_used_pct,
+            "alert_inode_pct": alert_inode_pct,
+            "filesystems": filesystems,
+            "watch_paths": watch_paths_out,
+            "alerts": alerts,
+            "errors": errors,
+        }
+
+    def collect_disk_report(self) -> dict[str, Any]:
+        config = self._configured_disk_report()
+        refresh_seconds = max(5, int(config.get("refresh_seconds", 120)))
+        now_dt = dt.datetime.now(dt.timezone.utc)
+        with self._disk_cache_lock:
+            if self._disk_cache_at and self._disk_cache_payload:
+                age = (now_dt - self._disk_cache_at).total_seconds()
+                if age < refresh_seconds:
+                    return self._disk_cache_payload
+
+        report = self._build_disk_report(now_dt)
+        with self._disk_cache_lock:
+            self._disk_cache_at = now_dt
+            self._disk_cache_payload = report
+        return report
+
     def collect_status(self) -> dict[str, Any]:
         uptime = uptime_seconds()
-        disk = shutil.disk_usage("/")
+        disk_report = self.collect_disk_report()
+        root_fs = next((x for x in disk_report.get("filesystems", []) if x.get("mount") == "/"), None)
+        if root_fs:
+            disk_root = {
+                "total_bytes": root_fs.get("total_bytes", 0),
+                "used_bytes": root_fs.get("used_bytes", 0),
+                "free_bytes": root_fs.get("free_bytes", 0),
+                "used_pct": root_fs.get("used_pct", 0.0),
+            }
+        else:
+            disk = shutil.disk_usage("/")
+            disk_root = {
+                "total_bytes": disk.total,
+                "used_bytes": disk.used,
+                "free_bytes": disk.free,
+                "used_pct": round((disk.used / disk.total * 100.0), 2) if disk.total else 0.0,
+            }
         container_map, container_error = self._container_status_map()
         now_iso = now_utc()
 
@@ -997,12 +1294,8 @@ class RemoteControlApi:
             "uptime_seconds": uptime,
             "load_avg": list(os.getloadavg()) if hasattr(os, "getloadavg") else None,
             "memory": mem_snapshot(),
-            "disk_root": {
-                "total_bytes": disk.total,
-                "used_bytes": disk.used,
-                "free_bytes": disk.free,
-                "used_pct": round((disk.used / disk.total * 100.0), 2) if disk.total else 0.0,
-            },
+            "disk_root": disk_root,
+            "disk_report": disk_report,
             "sqlite_db_path": str(self.db_path),
             "targets": {
                 "services": [],

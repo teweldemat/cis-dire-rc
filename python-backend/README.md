@@ -26,6 +26,21 @@ The backend stores runtime state in SQLite:
 
 Default DB path: `./data/health.sqlite3` (WAL mode).
 
+## Comprehensive disk report
+
+`GET /api/v1/status` now includes:
+
+- `disk_report.filesystems` (space and inode usage per mount)
+- `disk_report.watch_paths` (du-based size for selected paths)
+- `disk_report.alerts` (threshold breaches)
+
+Configure behavior in `config.json` under `targets.disk_report`:
+
+- refresh/caching interval
+- alert thresholds
+- filesystem-type exclusions
+- watched paths and path-scan limits
+
 ## Scheduled probes
 
 Configure probes in `config.json` under `scheduled_probes`.

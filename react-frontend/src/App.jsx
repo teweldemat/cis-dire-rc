@@ -62,6 +62,27 @@ function bytesToGb(n) {
   return `${(Number(n) / (1024 ** 3)).toFixed(2)} GB`;
 }
 
+function bytesToHuman(n) {
+  if (n === null || n === undefined || Number.isNaN(n)) return "-";
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let value = Number(n);
+  let unitIndex = 0;
+  while (value >= 1024 && unitIndex < units.length - 1) {
+    value /= 1024;
+    unitIndex += 1;
+  }
+  return `${value.toFixed(value >= 100 ? 0 : value >= 10 ? 1 : 2)} ${units[unitIndex]}`;
+}
+
+function diskCardClass(item) {
+  if (!item) return "warn";
+  if (item.is_alert) return "bad";
+  const used = Number(item.used_pct ?? 0);
+  const inodeUsed = Number(item.inodes_used_pct ?? 0);
+  if (used >= 75 || inodeUsed >= 75) return "warn";
+  return "ok";
+}
+
 export default function App() {
   const [token, setToken] = useState(() => sessionStorage.getItem("rc_token") || "");
   const [status, setStatus] = useState(null);
@@ -76,6 +97,14 @@ export default function App() {
   const containers = status?.targets?.containers || [];
   const tcpChecks = status?.targets?.tcp_checks || [];
   const scheduledProbes = status?.scheduled_probes || [];
+  const diskReport = status?.disk_report || {};
+  const diskFilesystems = diskReport?.filesystems || [];
+  const diskWatchPaths = diskReport?.watch_paths || [];
+  const diskAlerts = diskReport?.alerts || [];
+  const rootFs = useMemo(
+    () => diskFilesystems.find((fs) => fs.mount === "/") || null,
+    [diskFilesystems]
+  );
 
   const firstService = services[0]?.name || "";
   const firstContainer = containers[0]?.name || "";
@@ -235,17 +264,25 @@ export default function App() {
         </div>
         <div className="metric-card">
           <h3>Disk /</h3>
-          <p>{formatPercent(status?.disk_root?.used_pct)}</p>
+          <p>{formatPercent(rootFs?.used_pct ?? status?.disk_root?.used_pct)}</p>
         </div>
         <div className="metric-card">
-          <h3>Disk Used</h3>
-          <p>{bytesToGb(status?.disk_root?.used_bytes)}</p>
+          <h3>Disk / Used</h3>
+          <p>{bytesToGb(rootFs?.used_bytes ?? status?.disk_root?.used_bytes)}</p>
+        </div>
+        <div className="metric-card">
+          <h3>Disk / Inodes</h3>
+          <p>{formatPercent(rootFs?.inodes_used_pct)}</p>
         </div>
         <div className="metric-card">
           <h3>Expensive Probes</h3>
           <p>
             {scheduledProbes.length - degradedProbeCount}/{scheduledProbes.length} healthy
           </p>
+        </div>
+        <div className="metric-card">
+          <h3>Disk Alerts</h3>
+          <p>{diskAlerts.length}</p>
         </div>
       </section>
 
@@ -308,6 +345,57 @@ export default function App() {
                 <p>Next run: {formatIso(probe.next_run_at)}</p>
                 <p>Checks: {summarizeProbeSteps(probe.latest_run?.payload)}</p>
                 {probe.latest_run?.error ? <p className="error-text">Error: {probe.latest_run.error}</p> : null}
+              </article>
+            ))
+          )}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Disk Filesystems</h2>
+        {diskReport?.errors?.length ? (
+          <div className="error-banner">
+            {diskReport.errors.map((e, i) => (
+              <div key={i}>{e}</div>
+            ))}
+          </div>
+        ) : null}
+        <p className="hint">
+          Snapshot: {formatIso(diskReport?.collected_at)} | Alerts when space or inode use is above
+          {` ${diskReport?.alert_used_pct ?? 85}%`}
+        </p>
+        <div className="grid-list">
+          {diskFilesystems.length === 0 ? (
+            <p className="hint">No filesystem data available.</p>
+          ) : (
+            diskFilesystems.map((fs) => (
+              <article key={`${fs.filesystem}-${fs.mount}`} className={`status-card ${diskCardClass(fs)}`}>
+                <h3>{fs.mount}</h3>
+                <p>Device: {fs.filesystem}</p>
+                <p>Type: {fs.fs_type}</p>
+                <p>Used: {formatPercent(fs.used_pct)} ({bytesToHuman(fs.used_bytes)} / {bytesToHuman(fs.total_bytes)})</p>
+                <p>Free: {bytesToHuman(fs.free_bytes)}</p>
+                <p>Inodes: {formatPercent(fs.inodes_used_pct)}</p>
+              </article>
+            ))
+          )}
+        </div>
+      </section>
+
+      <section className="panel">
+        <h2>Disk Path Usage</h2>
+        <div className="grid-list">
+          {diskWatchPaths.length === 0 ? (
+            <p className="hint">No watched paths configured.</p>
+          ) : (
+            diskWatchPaths.map((row) => (
+              <article key={row.path} className={`status-card ${row.is_alert ? "bad" : "ok"}`}>
+                <h3>{row.path}</h3>
+                <p>Path Size: {bytesToHuman(row.du_bytes)}</p>
+                <p>Mount: {row.mount || "-"}</p>
+                <p>FS Used: {formatPercent(row.fs_used_pct)}</p>
+                <p>Inodes: {formatPercent(row.fs_inodes_used_pct)}</p>
+                {row.error ? <p className="error-text">{row.error}</p> : null}
               </article>
             ))
           )}
