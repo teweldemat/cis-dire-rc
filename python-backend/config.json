@@ -1,0 +1,84 @@
+{
+  "targets": {
+    "services": [
+      "nginx",
+      "postgresql@16-main",
+      "rc-control"
+    ],
+    "containers": [
+      "cis-core-backend-1",
+      "cis-core-frontend-1",
+      "cis-core-geoserver-1",
+      "jj-cis-core-backend-1",
+      "jj-cis-core-frontend-1",
+      "jj-cis-core-geoserver-1",
+      "bill-sqlserver"
+    ],
+    "tcp_checks": [
+      {
+        "name": "PostgreSQL",
+        "host": "127.0.0.1",
+        "port": 49153,
+        "timeout_seconds": 1.5
+      },
+      {
+        "name": "MSSQL Billing",
+        "host": "127.0.0.1",
+        "port": 14331,
+        "timeout_seconds": 1.5
+      },
+      {
+        "name": "CIS Backend",
+        "host": "127.0.0.1",
+        "port": 5000,
+        "timeout_seconds": 1.5
+      },
+      {
+        "name": "GeoServer",
+        "host": "127.0.0.1",
+        "port": 8080,
+        "timeout_seconds": 1.5
+      }
+    ]
+  },
+  "scheduled_probes": [
+    {
+      "key": "sms_health",
+      "type": "sms_health",
+      "enabled": true,
+      "interval_seconds": 300,
+      "timeout_seconds": 10,
+      "stale_after_seconds": 900,
+      "config": {
+        "afro_base_url_env": "AFRO_SMS_BASE_URL",
+        "pg_dsn_env": "RC_PG_DSN",
+        "max_outbox": 200,
+        "max_failed_recent": 20,
+        "failed_recent_rows": 200
+      }
+    },
+    {
+      "key": "nid_health",
+      "type": "nid_health",
+      "enabled": true,
+      "interval_seconds": 300,
+      "timeout_seconds": 10,
+      "stale_after_seconds": 900,
+      "config": {
+        "base_url_env": "NID_BASE_URL"
+      }
+    }
+  ],
+  "actions": {
+    "service": [
+      "start",
+      "stop",
+      "restart"
+    ],
+    "container": [
+      "start",
+      "stop",
+      "restart"
+    ]
+  }
+}

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Backend runtime data
+python-backend/data/*.sqlite3
+python-backend/data/*.sqlite3-*
+python-backend/data/*.db
+python-backend/data/*.log
+python-backend/data/*.tmp
+
+# Node
+react-frontend/node_modules/
+react-frontend/dist/
+
+# Local env overrides
+.env
+.env.*
+!.env.example
+rc-control.env
+
+# OS/editor
+.DS_Store
+.vscode/
+.idea/

@@ -1,0 +1,18 @@
+[Unit]
+Description=DIRE Remote Control Board API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tewelde
+Group=tewelde
+WorkingDirectory=/opt/rc-control/backend
+EnvironmentFile=/etc/rc-control.env
+ExecStart=/usr/bin/python3 /opt/rc-control/backend/remote_control_server.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

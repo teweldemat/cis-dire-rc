@@ -1,0 +1,14 @@
+# Install with:
+#   sudo cp rc-control.sudoers.example /etc/sudoers.d/rc-control
+#   sudo chmod 440 /etc/sudoers.d/rc-control
+#
+# Restrict remote-control service account to only the needed commands.
+
+tewelde ALL=(root) NOPASSWD: \
+  /bin/systemctl start *, \
+  /bin/systemctl stop *, \
+  /bin/systemctl restart *, \
+  /usr/bin/docker ps *, \
+  /usr/bin/docker start *, \
+  /usr/bin/docker stop *, \
+  /usr/bin/docker restart *
