@@ -1,0 +1,20 @@
+[Unit]
+Description=DIRE Remote Control Privileged Helper
+After=network-online.target docker.service
+Wants=network-online.target docker.service
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/rc-control/backend
+EnvironmentFile=/etc/rc-control.env
+ExecStart=/usr/bin/python3 /opt/rc-control/backend/privileged_helper.py
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

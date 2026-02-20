@@ -1,7 +1,7 @@
 [Unit]
 Description=DIRE Remote Control Board API
-After=network-online.target
-Wants=network-online.target
+After=network-online.target rc-control-helper.service
+Wants=network-online.target rc-control-helper.service
 
 [Service]
 Type=simple

@@ -22,6 +22,8 @@ DEFAULT_CONFIG_PATH = BASE_DIR / "config.json"
 DEFAULT_BIND_HOST = "127.0.0.1"
 DEFAULT_BIND_PORT = 8765
 DEFAULT_DB_PATH = BASE_DIR / "data" / "health.sqlite3"
+DEFAULT_HELPER_SOCKET = "/run/rc-control/helper.sock"
+DEFAULT_HELPER_TIMEOUT_SECONDS = 15
 MAX_AUDIT_LIMIT = 500
 
 
@@ -98,6 +100,126 @@ def run_cmd(command: list[str], timeout: int = 20) -> dict[str, Any]:
             "stdout": "",
             "stderr": str(ex),
             "command": command,
+        }
+
+
+class PrivilegedHelperClient:
+    def __init__(self):
+        self.socket_path = Path(os.environ.get("RC_HELPER_SOCKET", DEFAULT_HELPER_SOCKET)).resolve()
+        self.timeout_seconds = max(1, env_int("RC_HELPER_TIMEOUT_SECONDS", DEFAULT_HELPER_TIMEOUT_SECONDS))
+        self.max_body_bytes = max(1024, env_int("RC_HELPER_MAX_BODY_BYTES", 16384))
+
+    def _request(self, payload: dict[str, Any]) -> dict[str, Any]:
+        try:
+            raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        except Exception as ex:  # noqa: BLE001
+            return {
+                "ok": False,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": f"Failed to encode helper request: {ex}",
+            }
+
+        if len(raw) > self.max_body_bytes:
+            return {
+                "ok": False,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": f"Helper request exceeds max body size ({self.max_body_bytes} bytes).",
+            }
+
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(float(self.timeout_seconds))
+                sock.connect(str(self.socket_path))
+                sock.sendall(raw + b"\n")
+                sock.shutdown(socket.SHUT_WR)
+                chunks: list[bytes] = []
+                while True:
+                    data = sock.recv(65536)
+                    if not data:
+                        break
+                    chunks.append(data)
+        except FileNotFoundError:
+            return {
+                "ok": False,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": f"Privileged helper socket not found: {self.socket_path}",
+            }
+        except TimeoutError:
+            return {
+                "ok": False,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": f"Privileged helper timed out after {self.timeout_seconds}s",
+            }
+        except OSError as ex:
+            return {
+                "ok": False,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": f"Privileged helper communication error: {ex}",
+            }
+
+        if not chunks:
+            return {
+                "ok": False,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": "Privileged helper returned an empty response.",
+            }
+
+        blob = b"".join(chunks).strip()
+        try:
+            response = json.loads(blob.decode("utf-8"))
+        except Exception:
+            text = blob.decode("utf-8", errors="replace")
+            return {
+                "ok": False,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": f"Invalid response from privileged helper: {text[:240]}",
+            }
+        if not isinstance(response, dict):
+            return {
+                "ok": False,
+                "return_code": -1,
+                "stdout": "",
+                "stderr": "Privileged helper response must be a JSON object.",
+            }
+        return response
+
+    def container_status_map(self) -> tuple[dict[str, dict[str, str]], str]:
+        out = self._request({"op": "container_status_map"})
+        if not out.get("ok"):
+            return {}, str(out.get("stderr", "") or out.get("stdout", "") or "Container status lookup failed.")
+
+        raw_map = out.get("containers")
+        if not isinstance(raw_map, dict):
+            return {}, "Invalid helper response: missing container map."
+
+        parsed: dict[str, dict[str, str]] = {}
+        for name, value in raw_map.items():
+            if not isinstance(name, str) or not isinstance(value, dict):
+                continue
+            parsed[name] = {
+                "status": str(value.get("status", "")),
+                "image": str(value.get("image", "")),
+                "ports": str(value.get("ports", "")),
+            }
+        return parsed, ""
+
+    def execute_action(self, target_type: str, action: str, target: str) -> dict[str, Any]:
+        op = "service_action" if target_type == "service" else "container_action"
+        response = self._request({"op": op, "action": action, "target": target})
+        return {
+            "ok": bool(response.get("ok", False)),
+            "return_code": int(response.get("return_code", -1))
+            if isinstance(response.get("return_code"), int)
+            else -1,
+            "stdout": str(response.get("stdout", "") or ""),
+            "stderr": str(response.get("stderr", "") or ""),
         }
 
 
@@ -916,6 +1038,7 @@ class RemoteControlApi:
         self.db_path = Path(os.environ.get("RC_DB_PATH", str(DEFAULT_DB_PATH))).resolve()
         self.store = SQLiteStore(self.db_path)
         self.probe_runner = ProbeRunner()
+        self.privileged = PrivilegedHelperClient()
         self.store.sync_probe_definitions(self._configured_scheduled_probes())
         self._disk_cache_lock = threading.Lock()
         self._disk_cache_at: dt.datetime | None = None
@@ -981,30 +1104,7 @@ class RemoteControlApi:
         }
 
     def _container_status_map(self) -> tuple[dict[str, dict[str, str]], str]:
-        out = run_cmd(
-            [
-                "sudo",
-                "-n",
-                "docker",
-                "ps",
-                "-a",
-                "--format",
-                "{{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}",
-            ]
-        )
-        if not out["ok"]:
-            return {}, out["stderr"] or out["stdout"]
-        result: dict[str, dict[str, str]] = {}
-        for line in out["stdout"].splitlines():
-            parts = line.split("\t")
-            if len(parts) < 4:
-                continue
-            result[parts[0]] = {
-                "status": parts[1],
-                "image": parts[2],
-                "ports": parts[3],
-            }
-        return result, ""
+        return self.privileged.container_status_map()
 
     @staticmethod
     def _mount_matches_path(path: str, mount: str) -> bool:
@@ -1380,14 +1480,12 @@ class RemoteControlApi:
             allowed = set(self._configured_services())
             if target not in allowed:
                 return 403, {"ok": False, "error": f"Service '{target}' is not in allowlist."}
-            command = ["sudo", "-n", "systemctl", action, target]
         else:
             allowed = set(self._configured_containers())
             if target not in allowed:
                 return 403, {"ok": False, "error": f"Container '{target}' is not in allowlist."}
-            command = ["sudo", "-n", "docker", action, target]
 
-        result = run_cmd(command, timeout=45)
+        result = self.privileged.execute_action(target_type=target_type, action=action, target=target)
         response = {
             "ok": result["ok"],
             "target_type": target_type,

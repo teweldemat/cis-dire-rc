@@ -2,6 +2,8 @@
 
 Lightweight Python service (no third-party dependencies) that exposes a secure JSON API for monitoring and administrative actions.
 
+Privileged actions are executed by a separate root helper (`privileged_helper.py`) via a local Unix socket.
+
 ## API
 
 - `GET /api/v1/health` (no token)
@@ -64,6 +66,10 @@ Supported probe types:
 - `RC_BIND_PORT` (default: `8765`)
 - `RC_MAX_BODY_BYTES` (default: `16384`)
 - `RC_PROBE_TICK_SECONDS` (default: `2`)
+- `RC_HELPER_SOCKET` (default: `/run/rc-control/helper.sock`)
+- `RC_HELPER_SOCKET_GROUP` (default: `tewelde`)
+- `RC_HELPER_TIMEOUT_SECONDS` (default: `15`)
+- `RC_HELPER_MAX_BODY_BYTES` (default: `16384`)
 - `RC_PG_DSN` (optional, for DB-backed SMS probe checks)
 - `AFRO_SMS_BASE_URL` (optional)
 - `NID_BASE_URL` (optional)
@@ -73,5 +79,6 @@ Supported probe types:
 ```bash
 cd deploy/site-config/dire/remot-control/python-backend
 export RC_ADMIN_TOKEN='change-this'
+python3 privileged_helper.py &
 python3 remote_control_server.py
 ```
